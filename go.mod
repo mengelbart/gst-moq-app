@@ -4,7 +4,7 @@ go 1.21.1
 
 require (
 	github.com/mengelbart/gst-go v0.0.4
-	github.com/mengelbart/moqtransport v0.1.0
+	github.com/mengelbart/moqtransport v0.1.1-0.20231007110949-d6b0470c8219
 )
 
 require (
@@ -24,5 +24,3 @@ require (
 	golang.org/x/text v0.9.0 // indirect
 	golang.org/x/tools v0.9.1 // indirect
 )
-
-replace github.com/mengelbart/moqtransport v0.1.0 => ../moqtransport
