@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"errors"
 	"flag"
 	"log"
 	"math/big"
@@ -15,7 +14,11 @@ import (
 
 	"github.com/mengelbart/gst-go"
 	"github.com/mengelbart/moqtransport"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/logging"
 )
+
+const alpn = "moq-01"
 
 func main() {
 	isServer := flag.Bool("server", false, "run as receiving server")
@@ -36,43 +39,10 @@ func main() {
 }
 
 func server() error {
+	ph := newPeerHandler([]string{"moq"})
+	ph.addMediaTrackFactory("moq/video", newGstreamerSrcTrack)
 	s := moqtransport.Server{
-		Handler: moqtransport.PeerHandlerFunc(func(p *moqtransport.Peer) {
-			log.Println("handling new peer")
-			defer log.Println("XXX")
-			p.OnAnnouncement(func(s string) error {
-				log.Printf("got announcement: %v", s)
-				return nil
-			})
-			if err := p.Announce("video"); err != nil {
-				log.Printf("failed to announce video: %v", err)
-			}
-			log.Println("announced video namespace")
-			p.OnSubscription(func(s string, st *moqtransport.SendTrack) (uint64, time.Duration, error) {
-				log.Printf("handling subscription to track %s", s)
-				if s != "video" {
-					return 0, 0, errors.New("unknown trackname")
-				}
-				p, err := gst.NewPipeline("videotestsrc ! queue ! videoconvert ! jpegenc ! multipartmux ! appsink name=appsink")
-				if err != nil {
-					log.Fatal(err)
-				}
-				p.SetBufferHandler(func(b gst.Buffer) {
-					if _, err := st.Write(b.Bytes); err != nil {
-						panic(err)
-					}
-				})
-				p.SetEOSHandler(func() {
-					p.Stop()
-				})
-				p.SetErrorHandler(func(err error) {
-					log.Println(err)
-					p.Stop()
-				})
-				p.Start()
-				return 0, 0, nil
-			})
-		}),
+		Handler:   ph,
 		TLSConfig: generateTLSConfig(),
 	}
 	if err := s.ListenQUIC(context.Background(), "localhost:1909"); err != nil {
@@ -82,66 +52,44 @@ func server() error {
 }
 
 func client() error {
-	announcementCh := make(chan string)
-	closeCh := make(chan struct{})
+	tlsConf := tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{alpn},
+	}
 
-	c, err := moqtransport.DialQUIC(context.Background(), "localhost:1909")
+	bitrateCh := make(chan uint64, 100)
+	conn, err := quic.DialAddr(context.TODO(), "localhost:1909", &tlsConf, &quic.Config{
+		MaxIdleTimeout:  60 * time.Second,
+		EnableDatagrams: true,
+		Tracer: func(_ context.Context, _ logging.Perspective, _ quic.ConnectionID) *logging.ConnectionTracer {
+			lastEntry := time.Now()
+			sumReceived := 0
+			return &logging.ConnectionTracer{
+				ReceivedShortHeaderPacket: func(_ *logging.ShortHeader, bc logging.ByteCount, _ logging.ECN, _ []logging.Frame) {
+					sumReceived += int(bc)
+					if time.Since(lastEntry) > time.Second {
+						bits := 8 * sumReceived
+						bitrateCh <- uint64(bits)
+						log.Printf("received %v bytes (%v bits) in last second => %v Mbit/s", sumReceived, bits, float64(bits)/1e6)
+						lastEntry = time.Now()
+						sumReceived = 0
+					}
+				},
+			}
+		},
+	})
+	if err != nil {
+		return err
+	}
+	c, err := moqtransport.DialQUICConn(conn, moqtransport.DeliveryRole)
 	if err != nil {
 		return err
 	}
 	log.Println("moq peer connected")
-	c.OnAnnouncement(func(s string) error {
-		log.Printf("handling announcement of track %v", s)
-		announcementCh <- s
-		return nil
-	})
-
-	trackname := <-announcementCh
-	log.Printf("got announcement: %v", trackname)
-	p, err := gst.NewPipeline("appsrc name=src ! multipartdemux ! jpegdec ! autovideosink")
-	if err != nil {
-		return err
-	}
-	t, err := c.Subscribe(trackname)
-	if err != nil {
-		return err
-	}
-	p.SetEOSHandler(func() {
-		p.Stop()
-		closeCh <- struct{}{}
-	})
-	p.SetErrorHandler(func(err error) {
-		log.Println(err)
-		p.Stop()
-		closeCh <- struct{}{}
-	})
-	p.Start()
-	log.Println("starting pipeline")
-	go func() {
-		for {
-			log.Println("reading from track")
-			buf := make([]byte, 64_000)
-			n, err := t.Read(buf)
-			if err != nil {
-				log.Printf("error on read: %v", err)
-				p.SendEOS()
-			}
-			log.Printf("writing %v bytes from stream to pipeline", n)
-			_, err = p.Write(buf[:n])
-			if err != nil {
-				log.Printf("error on write: %v", err)
-				p.SendEOS()
-			}
-		}
-	}()
-
-	ml := gst.NewMainLoop()
-	go func() {
-		<-closeCh
-		ml.Stop()
-	}()
-	ml.Run()
-	return nil
+	ph := newPeerHandler([]string{"moqfb"})
+	ph.addMediaTrackFactory("moqfb/rate", newFeedbackTrackFactory(bitrateCh))
+	ph.Handle(c)
+	select {}
 }
 
 // Setup a bare-bones TLS config for the server
@@ -164,6 +112,6 @@ func generateTLSConfig() *tls.Config {
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{"moq-00"},
+		NextProtos:   []string{alpn},
 	}
 }
