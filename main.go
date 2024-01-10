@@ -11,7 +11,6 @@ import (
 	"flag"
 	"log"
 	"math/big"
-	"time"
 
 	"github.com/mengelbart/gst-go"
 	"github.com/mengelbart/moqtransport"
@@ -25,34 +24,47 @@ func main() {
 	defer gst.GstDeinit()
 
 	if *isServer {
-		if err := server(); err != nil {
+		if err := server(context.TODO()); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
-	if err := client(); err != nil {
+	if err := client(context.TODO()); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func server() error {
+func server(ctx context.Context) error {
 	s := moqtransport.Server{
-		Handler: moqtransport.PeerHandlerFunc(func(p *moqtransport.Peer) {
+		Handler: moqtransport.SessionHandlerFunc(func(p *moqtransport.Session) {
 			log.Println("handling new peer")
-			defer log.Println("XXX")
-			p.OnAnnouncement(func(s string) error {
-				log.Printf("got announcement: %v", s)
-				return nil
-			})
-			if err := p.Announce("video"); err != nil {
+			defer log.Println("done")
+
+			go func() {
+				for {
+					a, err := p.ReadAnnouncement(ctx)
+					if err != nil {
+						panic(err)
+					}
+					log.Printf("got announcement: %v", a)
+				}
+			}()
+			if err := p.Announce(ctx, "video"); err != nil {
 				log.Printf("failed to announce video: %v", err)
 			}
 			log.Println("announced video namespace")
-			p.OnSubscription(func(s string, st *moqtransport.SendTrack) (uint64, time.Duration, error) {
-				log.Printf("handling subscription to track %s", s)
-				if s != "video" {
-					return 0, 0, errors.New("unknown trackname")
+
+			for {
+				s, err := p.ReadSubscription(ctx)
+				if err != nil {
+					panic(err)
 				}
+				log.Printf("handling subscription to track %v", s)
+				if s.Trackname() != "video" {
+					panic(errors.New("unknown trackname"))
+				}
+				st := s.Accept()
+
 				p, err := gst.NewPipeline("videotestsrc ! queue ! videoconvert ! jpegenc ! multipartmux ! appsink name=appsink")
 				if err != nil {
 					log.Fatal(err)
@@ -70,8 +82,7 @@ func server() error {
 					p.Stop()
 				})
 				p.Start()
-				return 0, 0, nil
-			})
+			}
 		}),
 		TLSConfig: generateTLSConfig(),
 	}
@@ -81,28 +92,27 @@ func server() error {
 	return nil
 }
 
-func client() error {
-	announcementCh := make(chan string)
+func client(ctx context.Context) error {
 	closeCh := make(chan struct{})
 
-	c, err := moqtransport.DialQUIC(context.Background(), "localhost:1909")
+	c, err := moqtransport.DialQUIC("localhost:1909", moqtransport.IngestionDeliveryRole)
 	if err != nil {
 		return err
 	}
 	log.Println("moq peer connected")
-	c.OnAnnouncement(func(s string) error {
-		log.Printf("handling announcement of track %v", s)
-		announcementCh <- s
-		return nil
-	})
 
-	trackname := <-announcementCh
-	log.Printf("got announcement: %v", trackname)
+	a, err := c.ReadAnnouncement(ctx)
+	if err != nil {
+		return err
+	}
+	a.Accept()
+
+	log.Printf("got announcement: %v", a.Namespace())
 	p, err := gst.NewPipeline("appsrc name=src ! multipartdemux ! jpegdec ! autovideosink")
 	if err != nil {
 		return err
 	}
-	t, err := c.Subscribe(trackname)
+	t, err := c.Subscribe(ctx, a.Namespace(), "video", "")
 	if err != nil {
 		return err
 	}
