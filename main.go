@@ -11,6 +11,7 @@ import (
 	"flag"
 	"log"
 	"math/big"
+	"time"
 
 	"github.com/mengelbart/gst-go"
 	"github.com/mengelbart/moqtransport"
@@ -65,11 +66,12 @@ func server(ctx context.Context) error {
 				}
 				st := s.Accept()
 
-				p, err := gst.NewPipeline("videotestsrc ! queue ! videoconvert ! jpegenc ! multipartmux ! appsink name=appsink")
+				p, err := gst.NewPipeline("videotestsrc ! video/x-raw,format=I420,width=1280,height=720,framerate=30/1 ! vp8enc ! appsink name=appsink")
 				if err != nil {
 					log.Fatal(err)
 				}
 				p.SetBufferHandler(func(b gst.Buffer) {
+					log.Printf("%v got buffer of size: %v and duration: %v", time.Now().UnixMilli(), len(b.Bytes), b.Duration)
 					if _, err := st.Write(b.Bytes); err != nil {
 						panic(err)
 					}
@@ -108,7 +110,7 @@ func client(ctx context.Context) error {
 	a.Accept()
 
 	log.Printf("got announcement: %v", a.Namespace())
-	p, err := gst.NewPipeline("appsrc name=src ! multipartdemux ! jpegdec ! autovideosink")
+	p, err := gst.NewPipeline("appsrc name=src ! video/x-vp8 ! vp8dec ! video/x-raw,format=I420,width=1280,height=720,framerate=30/1 ! autovideosink")
 	if err != nil {
 		return err
 	}
@@ -130,7 +132,7 @@ func client(ctx context.Context) error {
 	go func() {
 		for {
 			log.Println("reading from track")
-			buf := make([]byte, 64_000)
+			buf := make([]byte, 10_000_000)
 			n, err := t.Read(buf)
 			if err != nil {
 				log.Printf("error on read: %v", err)
