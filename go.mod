@@ -4,7 +4,7 @@ go 1.22.0
 
 require (
 	github.com/mengelbart/gst-go v0.0.4
-	github.com/mengelbart/moqtransport v0.2.1-0.20240608071933-746b89cb6422
+	github.com/mengelbart/moqtransport v0.3.0
 	github.com/quic-go/quic-go v0.43.1
 )
 
