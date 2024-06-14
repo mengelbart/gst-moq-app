@@ -11,6 +11,9 @@ import (
 	"flag"
 	"log"
 	"math/big"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/mengelbart/gst-go"
 	"github.com/mengelbart/moqtransport"
@@ -23,121 +26,43 @@ func main() {
 	cert := flag.String("cert", "localhost.pem", "TLS certificate file (server only)")
 	key := flag.String("key", "localhost-key.pem", "TLS key file (server only)")
 	addr := flag.String("addr", "localhost:8080", "server address")
+	gstreamer := flag.Bool("gst", false, "use Gstreamer instead of FFMPEG")
 	flag.Parse()
 
-	gst.GstInit()
-	defer gst.GstDeinit()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	ctx := context.Background()
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-sigs:
+			cancel()
+		case <-ctx.Done():
+			return
+		}
+	}()
 
 	if *isServer {
-		if err := server(ctx, *addr, *cert, *key); err != nil {
+		s, err := newServer(ctx, *addr, *cert, *key, *gstreamer)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := s.run(ctx); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
-	if err := client(ctx, *addr); err != nil {
+	c, err := newClient(ctx, *addr, *gstreamer)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := c.run(ctx); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func server(ctx context.Context, addr, certFile, keyFile string) error {
-	tlsConfig, err := generateTLSConfigWithCertAndKey(certFile, keyFile)
-	if err != nil {
-		log.Printf("failed to generate TLS config from cert file and key, generating in memory certs: %v", err)
-		tlsConfig = generateTLSConfig()
-	}
-	listener, err := quic.ListenAddr(addr, tlsConfig, &quic.Config{
-		EnableDatagrams:            true,
-		MaxIncomingStreams:         1 << 60,
-		MaxStreamReceiveWindow:     1 << 60,
-		MaxIncomingUniStreams:      1 << 60,
-		MaxConnectionReceiveWindow: 1 << 60,
-	})
-	if err != nil {
-		return err
-	}
-	conn, err := listener.Accept(ctx)
-	if err != nil {
-		return err
-	}
-	s, err := moqtransport.NewServerSession(quicmoq.New(conn), true)
-	if err != nil {
-		return err
-	}
-
-	log.Printf("handling new peer")
-	go func() {
-		var a *moqtransport.Announcement
-		a, err = s.ReadAnnouncement(ctx)
-		if err != nil {
-			return
-		}
-		log.Printf("got announcement: %v", a.Namespace())
-		a.Reject(0, "server does not accept announcements")
-	}()
-
-	go func() {
-		if err = s.Announce(ctx, "video"); err != nil {
-			return
-		}
-		log.Printf("announced video namespace")
-	}()
-
-	sub, err := s.ReadSubscription(ctx)
-	if err != nil {
-		return err
-	}
-	log.Printf("handling subscription to track %s/%s", sub.Namespace(), sub.Trackname())
-	if sub.Trackname() != "video" {
-		err = errors.New("unknown trackname")
-		sub.Reject(0, err.Error())
-		return err
-	}
-	sub.Accept()
-	log.Printf("subscription accepted")
-
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-
-	p, err := gst.NewPipeline("videotestsrc is-live=true ! video/x-raw,width=480,height=320,framerate=30/1 ! clocksync ! vp8enc name=encoder target-bitrate=10000000 cpu-used=16 deadline=1 keyframe-max-dist=10 ! appsink name=appsink")
-	if err != nil {
-		err = errors.New("internal error")
-		sub.Reject(0, err.Error())
-		return err
-	}
-	p.SetEOSHandler(func() {
-		p.Stop()
-		cancel(errors.New("EOS"))
-	})
-	p.SetErrorHandler(func(err error) {
-		log.Println(err)
-		p.Stop()
-		cancel(err)
-	})
-	p.SetBufferHandler(func(b gst.Buffer) {
-		stream, err := sub.NewObjectStream(0, 0, 0)
-		if err != nil {
-			cancel(err)
-			return
-		}
-		if _, err := stream.Write(b.Bytes); err != nil {
-			cancel(err)
-			return
-		}
-		if err := stream.Close(); err != nil {
-			cancel(err)
-			return
-		}
-	})
-	p.Start()
-
-	<-ctx.Done()
-
-	return context.Cause(ctx)
-}
-
-func client(ctx context.Context, addr string) error {
+func client1(ctx context.Context, addr string) error {
 	conn, err := quic.DialAddr(ctx, addr, &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"moq-00"},
@@ -151,55 +76,62 @@ func client(ctx context.Context, addr string) error {
 	if err != nil {
 		return err
 	}
-	s, err := moqtransport.NewClientSession(quicmoq.New(conn), moqtransport.DeliveryRole, true)
-	if err != nil {
-		return err
-	}
-	a, err := s.ReadAnnouncement(ctx)
-	if err != nil {
-		return err
-	}
-	log.Printf("got announcement of namespace %v", a.Namespace())
-	a.Accept()
-	sub, err := s.Subscribe(ctx, 0, 0, a.Namespace(), "video", "")
-	if err != nil {
-		return err
-	}
-	log.Printf("subscribed to %v/%v", a.Namespace(), "video")
 	ctx, cancel := context.WithCancelCause(ctx)
-	p, err := gst.NewPipeline("appsrc name=src ! video/x-vp8 ! vp8dec ! video/x-raw,width=480,height=320,framerate=30/1 ! autovideosink")
-	if err != nil {
+	defer cancel(nil)
+	s := moqtransport.Session{
+		Conn:            quicmoq.New(conn),
+		EnableDatagrams: true,
+		LocalRole:       moqtransport.RoleSubscriber,
+		RemoteRole:      0,
+		AnnouncementHandler: moqtransport.AnnouncementHandlerFunc(func(s *moqtransport.Session, a *moqtransport.Announcement, arw moqtransport.AnnouncementResponseWriter) {
+			log.Printf("got announcement of namespace %v", a.Namespace())
+			arw.Accept()
+			sub, err := s.Subscribe(ctx, 0, 0, a.Namespace(), "video", "")
+			if err != nil {
+				return
+			}
+			log.Printf("subscribed to %v/%v", a.Namespace(), "video")
+			// p, err := gst.NewPipeline("appsrc name=src ! video/x-vp8 ! vp8dec ! video/x-raw, format=(string)I420, width=(int)1280, height=(int)720 ! autovideosink")
+			p, err := gst.NewPipeline("appsrc name=src ! video/x-vp8 ! vp8dec ! video/x-raw,width=1280,height=720,framerate=30/1 ! clocksync ! autovideosink")
+
+			// 			p, err := gst.NewPipeline("appsrc name=src ! video/x-vp8, profile=(string)0, streamheader=(buffer)< 4f56503830010100050002d00000010000010000003c00000001 >, width=(int)1280, height=(int)720, pixel-aspect-ratio=(fraction)1/1, framerate=(fraction)60/1, interlace-mode=(string)progressive, colorimetry=(string)bt709, chroma-site=(string)mpeg2, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono ! vp8dec ! video/x-raw, format=(string)I420, width=(int)1280, height=(int)720 ! autovideosink")
+			if err != nil {
+				return
+			}
+			p.SetEOSHandler(func() {
+				p.Stop()
+				cancel(errors.New("EOS"))
+			})
+			p.SetErrorHandler(func(err error) {
+				log.Println(err)
+				p.Stop()
+				cancel(err)
+			})
+			p.Start()
+
+			go func() {
+				for {
+					log.Println("reading from track")
+					obj, err := sub.ReadObject(ctx)
+					if err != nil {
+						log.Printf("error on read: %v", err)
+						p.SendEOS()
+					}
+					log.Printf("writing %v bytes from stream to pipeline", len(obj.Payload))
+					_, err = p.Write(obj.Payload)
+					if err != nil {
+						log.Printf("error on write: %v", err)
+						p.SendEOS()
+					}
+				}
+			}()
+		}),
+		SubscriptionHandler: nil,
+	}
+
+	if err := s.RunClient(); err != nil {
 		return err
 	}
-	p.SetEOSHandler(func() {
-		p.Stop()
-		cancel(errors.New("EOS"))
-	})
-	p.SetErrorHandler(func(err error) {
-		log.Println(err)
-		p.Stop()
-		cancel(err)
-	})
-	p.Start()
-
-	go func() {
-		for {
-			log.Println("reading from track")
-			buf := make([]byte, 64_000)
-			n, err := sub.Read(buf)
-			if err != nil {
-				log.Printf("error on read: %v", err)
-				p.SendEOS()
-			}
-			log.Printf("writing %v bytes from stream to pipeline", n)
-			_, err = p.Write(buf[:n])
-			if err != nil {
-				log.Printf("error on write: %v", err)
-				p.SendEOS()
-			}
-		}
-	}()
-
 	<-ctx.Done()
 
 	return context.Cause(ctx)
