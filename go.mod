@@ -3,12 +3,14 @@ module github.com/mengelbart/gst-moq-app
 go 1.22.0
 
 require (
-	github.com/mengelbart/gst-go v0.0.4
 	github.com/mengelbart/moqtransport v0.3.0
 	github.com/quic-go/quic-go v0.43.1
+	github.com/go-gst/go-gst v1.1.0
 )
 
 require (
+	github.com/go-gst/go-glib v1.1.0 // indirect
+	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
 	github.com/google/pprof v0.0.0-20240430035430-e4905b036c4e // indirect
 	github.com/onsi/ginkgo/v2 v2.17.2 // indirect
