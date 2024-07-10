@@ -14,6 +14,7 @@ import (
 type client struct {
 	ctx           context.Context
 	cancelCtx     context.CancelFunc
+	sender        *sender
 	session       *moqtransport.Session
 	gstInitOnce   sync.Once
 	gstDeInitOnce sync.Once
@@ -45,6 +46,7 @@ func newClient(ctx context.Context, addr string, sender *sender) (*client, error
 	return &client{
 		ctx:           ctx,
 		cancelCtx:     cancel,
+		sender:        sender,
 		session:       s,
 		gstInitOnce:   sync.Once{},
 		gstDeInitOnce: sync.Once{},
@@ -59,7 +61,7 @@ func (c *client) Close() error {
 	return nil
 }
 
-func (c *client) run(ctx context.Context, gstreamer bool, namespace string) error {
+func (c *client) run(ctx context.Context, gstreamer, feedback bool, namespace string) error {
 	if err := c.session.RunClient(); err != nil {
 		return err
 	}
@@ -67,6 +69,11 @@ func (c *client) run(ctx context.Context, gstreamer bool, namespace string) erro
 		r := newReceiver(c.session)
 		defer r.Close()
 		if err := r.subscribe(gstreamer, namespace); err != nil {
+			return err
+		}
+	}
+	if feedback {
+		if err := c.sender.subscribeToFeedbackTrack(c.session); err != nil {
 			return err
 		}
 	}

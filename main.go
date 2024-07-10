@@ -16,8 +16,10 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/mengelbart/moqtransport"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 var gstInitOnce sync.Once
@@ -38,6 +40,7 @@ func main() {
 	addr := flag.String("addr", "localhost:8080", "server address")
 	gstreamer := flag.Bool("gst", false, "use Gstreamer instead of FFMPEG")
 	namespace := flag.String("sub", "", "subscribe to track 'video' in <namespace>")
+	feedback := flag.Bool("fb", false, "subscribe to feedback track")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -55,12 +58,32 @@ func main() {
 	}()
 
 	sender := newSender()
+
+	// TODO: Replace this goroutine with correct feedback generator
+	// (this just updates the bitrate every second)
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		i := 0
+		for {
+			select {
+			case <-ticker.C:
+				newRate := ((i % 20) + 1) * 10000
+				log.Printf("sending rate: %v", newRate)
+				if err := sender.sendFeedback(quicvarint.Append([]byte{}, uint64(newRate))); err != nil {
+					panic(err)
+				}
+				i++
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 	if *isServer {
 		s, err := newServer(ctx, *addr, *cert, *key, sender)
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := s.run(ctx, *gstreamer, *namespace); err != nil {
+		if err := s.run(ctx, *gstreamer, *feedback, *namespace); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -69,7 +92,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := c.run(ctx, *gstreamer, *namespace); err != nil {
+	if err := c.run(ctx, *gstreamer, *feedback, *namespace); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"os"
 	"os/exec"
 
@@ -77,7 +76,6 @@ func (r *receiver) receiveGstreamer(track *moqtransport.RemoteTrack) error {
 				src.EndStream()
 				return
 			}
-			log.Printf("writing %v bytes from stream to pipeline", len(o.Payload))
 			buffer := gst.NewBufferWithSize(int64(len(o.Payload)))
 			buffer.Map(gst.MapWrite).WriteData(o.Payload)
 			defer buffer.Unmap()

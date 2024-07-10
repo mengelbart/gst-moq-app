@@ -10,11 +10,30 @@ import (
 	"github.com/go-gst/go-gst/gst"
 	"github.com/go-gst/go-gst/gst/app"
 	"github.com/mengelbart/moqtransport"
+	"github.com/quic-go/quic-go/quicvarint"
 )
+
+type feedbackSender struct {
+	objectID uint64
+	feedback *moqtransport.LocalTrack
+}
+
+func (f *feedbackSender) send(fb []byte) error {
+	f.objectID++
+	return f.feedback.WriteObject(context.Background(), moqtransport.Object{
+		GroupID:              0,
+		ObjectID:             f.objectID,
+		ObjectSendOrder:      0,
+		ForwardingPreference: moqtransport.ObjectForwardingPreferenceStreamGroup,
+		Payload:              fb,
+	})
+}
 
 type sender struct {
 	ctx       context.Context
 	cancelCtx context.CancelFunc
+	encoder   *gst.Element
+	fbs       *feedbackSender
 }
 
 func newSender() *sender {
@@ -22,6 +41,10 @@ func newSender() *sender {
 	return &sender{
 		ctx:       ctx,
 		cancelCtx: cancel,
+		encoder:   nil,
+		fbs: &feedbackSender{
+			feedback: moqtransport.NewLocalTrack(0, "feedback", "bitrate"),
+		},
 	}
 }
 
@@ -33,6 +56,32 @@ func (s *sender) Close() error {
 	return nil
 }
 
+func (s *sender) setEncoderBitrate(bps int) {
+	s.encoder.SetProperty("target-bitrate", bps)
+}
+
+func (s *sender) subscribeToFeedbackTrack(session *moqtransport.Session) error {
+	fbTrack, err := session.Subscribe(s.ctx, 1, 1, "feedback", "bitrate", "")
+	if err != nil {
+		return err
+	}
+	for {
+		o, err := fbTrack.ReadObject(s.ctx)
+		if err != nil {
+			return err
+		}
+		// TODO: Parse correct feedback format from o.Payload
+		rate, n, err := quicvarint.Parse(o.Payload)
+		if err != nil {
+			return err
+		}
+		if n != len(o.Payload) {
+			return errors.New("invalid rate format")
+		}
+		s.setEncoderBitrate(int(rate))
+	}
+}
+
 func (h *sender) HandleSubscription(session *moqtransport.Session, sub *moqtransport.Subscription, srw moqtransport.SubscriptionResponseWriter) {
 	switch sub.Namespace {
 	case "gstreamer":
@@ -41,8 +90,21 @@ func (h *sender) HandleSubscription(session *moqtransport.Session, sub *moqtrans
 	case "ffmpeg":
 		h.ffmpegSubscriptionHandler(session, sub, srw)
 		return
+	case "feedback":
+		h.feedbackSubscriptionHandler(session, sub, srw)
 	}
 	srw.Reject(0, "unknown namespace")
+}
+
+func (h *sender) feedbackSubscriptionHandler(_ *moqtransport.Session, sub *moqtransport.Subscription, srw moqtransport.SubscriptionResponseWriter) {
+	if sub.TrackName == "bitrate" {
+		srw.Accept(h.fbs.feedback)
+	}
+	srw.Reject(0, "track not found")
+}
+
+func (h *sender) sendFeedback(fb []byte) error {
+	return h.fbs.send(fb)
 }
 
 func (h *sender) gstreamerSubscriptionHandler(_ *moqtransport.Session, sub *moqtransport.Subscription, srw moqtransport.SubscriptionResponseWriter) {
@@ -62,18 +124,25 @@ func (h *sender) gstreamerSubscriptionHandler(_ *moqtransport.Session, sub *moqt
 		srw.Reject(0, "internal error")
 		return
 	}
-	elements, err := gst.NewElementMany("videotestsrc", "queue", "videoconvert", "vp8enc")
+	elements, err := gst.NewElementMany("videotestsrc", "queue", "videoconvert")
 	if err != nil {
 		srw.Reject(0, "internal error")
 		return
 	}
+	encoder, err := gst.NewElement("vp8enc")
+	if err != nil {
+		srw.Reject(0, "internal error")
+		return
+	}
+	h.encoder = encoder
+
 	sink, err := app.NewAppSink()
 	if err != nil {
 		srw.Reject(0, "internal error")
 		return
 	}
-	pipeline.AddMany(append(elements, sink.Element)...)
-	gst.ElementLinkMany(append(elements, sink.Element)...)
+	pipeline.AddMany(append(elements, encoder, sink.Element)...)
+	gst.ElementLinkMany(append(elements, encoder, sink.Element)...)
 	sink.SetCallbacks(&app.SinkCallbacks{
 		NewSampleFunc: func(sink *app.Sink) gst.FlowReturn {
 			sample := sink.PullSample()

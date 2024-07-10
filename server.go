@@ -10,6 +10,7 @@ import (
 )
 
 type server struct {
+	sender  *sender
 	session *moqtransport.Session
 }
 
@@ -35,6 +36,7 @@ func newServer(ctx context.Context, addr, certFile, keyFile string, sender *send
 		return nil, err
 	}
 	return &server{
+		sender: sender,
 		session: &moqtransport.Session{
 			Conn:                quicmoq.New(conn),
 			EnableDatagrams:     true,
@@ -46,7 +48,7 @@ func newServer(ctx context.Context, addr, certFile, keyFile string, sender *send
 	}, nil
 }
 
-func (s *server) run(ctx context.Context, gstreamer bool, namespace string) error {
+func (s *server) run(ctx context.Context, gstreamer, feedback bool, namespace string) error {
 	if err := s.session.RunServer(ctx); err != nil {
 		return err
 	}
@@ -56,6 +58,13 @@ func (s *server) run(ctx context.Context, gstreamer bool, namespace string) erro
 		if err := r.subscribe(gstreamer, namespace); err != nil {
 			return err
 		}
+	}
+	if feedback {
+		go func() {
+			if err := s.sender.subscribeToFeedbackTrack(s.session); err != nil {
+				panic(err)
+			}
+		}()
 	}
 	<-ctx.Done()
 	return ctx.Err()
