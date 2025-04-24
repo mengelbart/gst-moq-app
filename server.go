@@ -34,22 +34,24 @@ func newServer(ctx context.Context, addr, certFile, keyFile string, sender *send
 	if err != nil {
 		return nil, err
 	}
+	moqConn := quicmoq.NewServer(conn)
+	session := moqtransport.NewSession(moqConn.Protocol(), moqConn.Perspective(), 100)
+	transport := &moqtransport.Transport{
+		Conn:    moqConn,
+		Handler: sender,
+		Qlogger: nil,
+		Session: session,
+	}
+	if err = transport.Run(); err != nil {
+		return nil, err
+	}
+
 	return &server{
-		session: &moqtransport.Session{
-			Conn:                quicmoq.New(conn),
-			EnableDatagrams:     true,
-			LocalRole:           moqtransport.RolePubSub,
-			RemoteRole:          0,
-			AnnouncementHandler: nil,
-			SubscriptionHandler: sender,
-		},
+		session: session,
 	}, nil
 }
 
 func (s *server) run(ctx context.Context, gstreamer bool, namespace string) error {
-	if err := s.session.RunServer(ctx); err != nil {
-		return err
-	}
 	if len(namespace) > 0 {
 		r := newReceiver(s.session)
 		defer r.Close()

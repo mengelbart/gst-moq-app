@@ -35,7 +35,7 @@ func (r *receiver) Close() error {
 }
 
 func (r *receiver) subscribe(gstreamer bool, namespace string) error {
-	track, err := r.session.Subscribe(r.ctx, 0, 0, namespace, "video", "")
+	track, err := r.session.Subscribe(r.ctx, []string{namespace}, "video", "")
 	if err != nil {
 		return err
 	}

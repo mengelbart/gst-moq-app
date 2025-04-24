@@ -8,30 +8,18 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"flag"
-	"io"
 	"log"
-	"log/slog"
 	"math/big"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
-
-	"github.com/mengelbart/moqtransport"
 )
 
 var gstInitOnce sync.Once
 var gstDeinitOnce sync.Once
 
 func main() {
-	moqtransport.SetLogHandler(slog.NewJSONHandler(
-		io.Discard,
-		&slog.HandlerOptions{
-			AddSource: false,
-			Level:     nil,
-		},
-	))
-
 	isServer := flag.Bool("server", false, "true: run as sending server, false: run as receiving client")
 	cert := flag.String("cert", "localhost.pem", "TLS certificate file (server only)")
 	key := flag.String("key", "localhost-key.pem", "TLS key file (server only)")
